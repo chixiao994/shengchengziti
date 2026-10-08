@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.util.Log
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
@@ -262,15 +264,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 从文件名提取 Unicode 码点：
-     *   "我.svg"          -> U+6211
-     *   "U+6211.svg"      -> U+6211
-     *   "u6211.svg"       -> U+6211
-     *   "uni6211.svg"     -> U+6211
-     *   "我_001.svg"      -> U+6211（取第一个汉字）
-     *   "a.svg"           -> 'a'
-     */
     private fun codepointFromName(name: String): Int? {
         val base = name.substringBeforeLast('.')
 
@@ -310,14 +303,12 @@ class MainActivity : AppCompatActivity() {
 
     // ================= 重命名 =================
 
-    /** 用户点击「改」或按回车，显式重命名，有提示 */
     private fun commitRename() {
         val item = items.getOrNull(index) ?: return
         val raw = etName.text.toString()
         renameCurrent(item, raw, true)
     }
 
-    /** 切页/操作前静默提交，无变化则忽略 */
     private fun commitRenameSilent() {
         val item = items.getOrNull(index) ?: return
         val raw = etName.text.toString().trim()
@@ -335,11 +326,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!newName.lowercase().endsWith(".svg")) newName += ".svg"
-        if (newName == item.name) {
-            if (showToast) toast("文件名没变")
-            hideKeyboard()
-            return
-        }
 
         // 检查重名
         for (other in items) {
@@ -349,58 +335,62 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        val newCp = codepointFromName(newName)
+
         lifecycleScope.launch {
-            val ok = withContext(Dispatchers.IO) {
+            val oldCp = item.codepoint
+
+            // 尝试文件系统重命名（用 DocumentsContract 更稳）
+            val renamed = withContext(Dispatchers.IO) {
                 try {
-                    val df = DocumentFile.fromSingleUri(this@MainActivity, item.uri)
-                    df?.renameTo(newName) ?: false
+                    val newUri = DocumentsContract.renameDocument(
+                        contentResolver, item.uri, newName
+                    )
+                    if (newUri != null) {
+                        item.uri = newUri
+                        item.name = newName
+                        true
+                    } else {
+                        Log.w("SvgFont", "renameDocument returned null for $newName")
+                        false
+                    }
                 } catch (e: Exception) {
+                    Log.e("SvgFont", "renameDocument failed", e)
                     false
                 }
             }
-            if (!ok) {
-                if (showToast) toast("重命名失败")
-                return@launch
-            }
 
-            // 重新定位文件（重命名后 uri 可能变化）
-            val newUri = withContext(Dispatchers.IO) { findChildUri(inputUri, newName) }
-            if (newUri != null) item.uri = newUri
-
-            val oldCp = item.codepoint
-            item.name = newName
-            val cp = codepointFromName(newName)
-            if (cp != null && cp > 0) {
-                item.codepoint = cp
-            }
-
-            // 码点变了需要重新构建 glyph
-            if (item.codepoint != oldCp) {
+            // 关键：无论文件是否重命名成功，都更新码点（字体生成不依赖文件名）
+            if (newCp != null && newCp > 0 && newCp != oldCp) {
+                item.codepoint = newCp
                 item.glyph = null
                 parseOne(item)
+            }
+
+            // 文件重命名失败时，仍保留用户输入的显示名，让用户看到自己填的东西
+            // 状态保存时会同时记录 uri 和 name，下次加载按 uri 匹配，不会丢
+            if (!renamed) {
+                item.name = newName
             }
 
             saveState()
             updateUi()
 
-            // 已完成的字且码点变化 → 重新生成字体
+            // 已完成的字且码点变了 → 重新生成字体
             if (item.codepoint != oldCp && item.status == Status.DONE) {
                 appendFontAsync()
             }
 
             if (showToast) {
-                toast("已重命名为 $newName")
+                if (renamed) {
+                    toast("已重命名为 $newName")
+                } else if (item.codepoint != oldCp) {
+                    toast("已设为 U+${item.codepoint.toString(16).uppercase()}（文件未能改名）")
+                } else {
+                    toast("文件重命名失败")
+                }
                 hideKeyboard()
             }
-        }
-    }
-
-    private fun findChildUri(dir: Uri?, name: String): Uri? {
-        if (dir == null) return null
-        return try {
-            DocumentFile.fromTreeUri(this, dir)?.findFile(name)?.uri
-        } catch (_: Exception) {
-            null
         }
     }
 
@@ -427,6 +417,8 @@ class MainActivity : AppCompatActivity() {
                 o.put("n", it.name)
                 o.put("s", it.status.name)
                 o.put("c", it.codepoint)
+                // 记录文件名（可能有重命名失败的情况，用 name 匹配更稳）
+                o.put("u", it.uri.toString())
                 arr.put(o)
             }
             stateFile().writeText(arr.toString())
@@ -438,15 +430,31 @@ class MainActivity : AppCompatActivity() {
             val f = stateFile()
             if (!f.exists()) return
             val arr = JSONArray(f.readText())
-            val map = HashMap<String, JSONObject>()
+
+            // 同时按 name 和 uri 建索引
+            val byName = HashMap<String, JSONObject>()
+            val byUri = HashMap<String, JSONObject>()
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                map[o.getString("n")] = o
+                byName[o.getString("n")] = o
+                o.optString("u", "").takeIf { it.isNotEmpty() }?.let { byUri[it] = o }
             }
+
             for (it in items) {
-                val o = map[it.name] ?: continue
-                it.status = try { Status.valueOf(o.getString("s")) } catch (_: Exception) { Status.PENDING }
+                // 优先按 uri 匹配（文件名可以不同，uri 唯一）
+                val o = byUri[it.uri.toString()] ?: byName[it.name] ?: continue
+                it.status = try {
+                    Status.valueOf(o.getString("s"))
+                } catch (_: Exception) { Status.PENDING }
                 it.codepoint = o.optInt("c", 0)
+                // 恢复用户设置过的显示名
+                val savedName = o.optString("n", "")
+                if (savedName.isNotEmpty() && savedName != it.name) {
+                    // 只有当我们无法从文件系统拿到这个名字时才覆盖
+                    // 因为文件系统的真名才是"真相"，但如果用户重命名过、
+                    // 文件系统名和状态名不同，则以状态里的为准（用户意图）
+                    it.name = savedName
+                }
             }
         } catch (_: Exception) {}
     }
